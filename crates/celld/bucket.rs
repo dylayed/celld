@@ -9,13 +9,11 @@
 //! `Ok(None)` only for a clean 412/409 rejection; every other failure is
 //! ambiguous — the write may have committed — and surfaces as `Err`.
 
+use crate::storage_backend::ObjectStorageConfig;
 use anyhow::anyhow;
 use anyhow::Context;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use object_store::aws::AmazonS3;
-use object_store::aws::AmazonS3Builder;
-use object_store::aws::S3ConditionalPut;
 use object_store::path::Path;
 use object_store::Attribute;
 use object_store::Attributes;
@@ -28,31 +26,24 @@ use object_store::PutMode;
 use object_store::PutOptions;
 use object_store::PutPayload;
 use object_store::RetryConfig;
-use object_store::UpdateVersion;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Explicit credentials for a managed installation; everything else comes
-/// from the standard `AWS_*` environment.
-pub struct StaticCredentials {
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    pub session_token: Option<String>,
-}
 
 /// One S3-compatible bucket. Cheap to clone; each `open` builds its own
 /// HTTP transport, so a dedicated instance also isolates its traffic.
 #[derive(Clone)]
 pub struct Bucket {
-    store: Arc<AmazonS3>,
+    store: Arc<dyn ObjectStore>,
     /// Conditional writes only, built with retries OFF: a retried CAS put
-    /// can land on the first attempt's own etag change and report a clean
-    /// 412 — converting "may have committed" into a false rejection. The
-    /// ambiguity must surface as `Err` so the caller reconciles.
-    cas_store: Arc<AmazonS3>,
+    /// can observe the first attempt's object-version change and report a
+    /// definite precondition rejection — converting "may have committed" into
+    /// a false rejection. The ambiguity must surface as `Err` so the caller
+    /// reconciles.
+    cas_store: Arc<dyn ObjectStore>,
     /// Bucket name, for messages — the store is already bound to it.
     pub name: String,
+    storage_config: ObjectStorageConfig,
 }
 
 impl Bucket {
@@ -60,10 +51,7 @@ impl Bucket {
     /// AppName format, `app/<name>`), keeping e.g. the lease safety lane
     /// observable in black-box storage traces.
     pub fn open(
-        bucket: &str,
-        endpoint: Option<&str>,
-        region: &str,
-        credentials: Option<StaticCredentials>,
+        storage_config: ObjectStorageConfig,
         app: Option<&str>,
     ) -> anyhow::Result<Bucket> {
         // These bounds mirror the aws-sdk TimeoutConfig they replace
@@ -80,65 +68,46 @@ impl Bucket {
                     .context("app user agent")?,
             );
         }
-        let mut builder = AmazonS3Builder::from_env()
-            .with_bucket_name(bucket)
-            .with_region(region)
-            .with_conditional_put(S3ConditionalPut::ETagMatch)
-            .with_retry(RetryConfig {
-                max_retries: 2,
-                retry_timeout: Duration::from_secs(30),
-                ..RetryConfig::default()
-            })
-            .with_client_options(options);
-        if let Some(endpoint) = endpoint {
-            // Path-style against explicit S3-compatible endpoints, exactly
-            // as the aws client's force_path_style(endpoint.is_some()).
-            builder = builder
-                .with_endpoint(endpoint)
-                .with_virtual_hosted_style_request(false);
-        } else {
-            builder = builder.with_virtual_hosted_style_request(true);
-        }
-        if let Some(credentials) = credentials {
-            builder = builder
-                .with_access_key_id(credentials.access_key_id)
-                .with_secret_access_key(credentials.secret_access_key);
-            if let Some(token) = credentials.session_token {
-                builder = builder.with_token(token);
-            }
-        }
-        let cas_builder = builder.clone().with_retry(RetryConfig {
-            max_retries: 0,
+        let retry = |max_retries| RetryConfig {
+            max_retries,
             retry_timeout: Duration::from_secs(30),
             ..RetryConfig::default()
-        });
+        };
+        let ordinary_retry = retry(2);
+        let cas_retry = retry(0);
+        let (store, cas_store) =
+            storage_config.build_bucket_stores(options, ordinary_retry, cas_retry)?;
         Ok(Bucket {
-            store: Arc::new(builder.build().context("build s3 client")?),
-            cas_store: Arc::new(cas_builder.build().context("build s3 cas client")?),
-            name: bucket.to_string(),
+            store,
+            cas_store,
+            name: storage_config.bucket().to_string(),
+            storage_config,
         })
     }
 
-    /// Body and etag, or `None` when the key does not exist.
+    /// Body and object version, or `None` when the key does not exist.
     pub async fn get(&self, key: &str) -> anyhow::Result<Option<(Bytes, String)>> {
         match self.store.get(&Path::from(key)).await {
             Ok(result) => {
-                let etag = result.meta.e_tag.clone().unwrap_or_default();
+                let version = self.storage_config.object_version(&result.meta);
                 let bytes = result
                     .bytes()
                     .await
                     .with_context(|| format!("read body s3://{}/{key}", self.name))?;
-                Ok(Some((bytes, etag)))
+                Ok(Some((bytes, version)))
             }
             Err(Error::NotFound { .. }) => Ok(None),
             Err(error) => Err(anyhow!(error).context(format!("read s3://{}/{key}", self.name))),
         }
     }
 
-    /// Size and etag, or `None` when the key does not exist.
+    /// Size and object version, or `None` when the key does not exist.
     pub async fn head(&self, key: &str) -> anyhow::Result<Option<(u64, String)>> {
         match self.store.head(&Path::from(key)).await {
-            Ok(meta) => Ok(Some((meta.size as u64, meta.e_tag.unwrap_or_default()))),
+            Ok(meta) => {
+                let version = self.storage_config.object_version(&meta);
+                Ok(Some((meta.size as u64, version)))
+            }
             Err(Error::NotFound { .. }) => Ok(None),
             Err(error) => Err(anyhow!(error).context(format!("head s3://{}/{key}", self.name))),
         }
@@ -201,29 +170,29 @@ impl Bucket {
         Ok(())
     }
 
-    /// Conditional write. `etag: None` requires the key to be absent
-    /// (If-None-Match: *); `Some` requires the current etag (If-Match).
-    /// `Ok(Some(new_etag))` applied, `Ok(None)` cleanly rejected; any other
+    /// Conditional write. `version: None` requires the key to be absent;
+    /// `Some` requires the current provider object version.
+    /// `Ok(Some(new_version))` applied, `Ok(None)` cleanly rejected; any other
     /// failure is ambiguous and stays an error.
     pub async fn put_cas(
         &self,
         key: &str,
         body: impl Into<PutPayload>,
-        etag: Option<&str>,
+        version: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
-        let mode = match etag {
+        let mode = match version {
             None => PutMode::Create,
-            Some(etag) => PutMode::Update(UpdateVersion {
-                e_tag: Some(etag.to_string()),
-                version: None,
-            }),
+            Some(version) => PutMode::Update(self.storage_config.update_version(version)),
         };
         match self
             .cas_store
             .put_opts(&Path::from(key), body.into(), PutOptions::from(mode))
             .await
         {
-            Ok(result) => Ok(Some(result.e_tag.unwrap_or_default())),
+            Ok(result) => {
+                let new_version = self.storage_config.put_result_version(result);
+                Ok(Some(new_version))
+            }
             Err(Error::Precondition { .. } | Error::AlreadyExists { .. }) => Ok(None),
             Err(error) => Err(anyhow!(error).context(format!(
                 "conditional write s3://{}/{key} may have committed",
@@ -308,7 +277,8 @@ pub fn is_unauthorized(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod live_cas {
-    use super::{Bucket, StaticCredentials};
+    use super::Bucket;
+    use crate::storage_backend::{ObjectStorageConfig, StaticCredentials};
 
     // Live CAS contract against a real S3-compatible bucket (R2). Gated on
     // CELLD_CAS_LIVE=1 so it never runs in CI; a mock cannot answer whether
@@ -324,19 +294,15 @@ mod live_cas {
         let name = std::env::var("CELLD_CAS_BUCKET").expect("CELLD_CAS_BUCKET");
         let endpoint = std::env::var("CELLD_CAS_ENDPOINT").ok();
         let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "auto".into());
-        let creds = StaticCredentials {
+        let credentials = StaticCredentials {
             access_key_id: std::env::var("AWS_ACCESS_KEY_ID").unwrap(),
             secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY").unwrap(),
             session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
         };
-        let bucket = Bucket::open(
-            &name,
-            endpoint.as_deref(),
-            &region,
-            Some(creds),
-            Some("cas-test"),
-        )
-        .expect("open bucket");
+        let storage = ObjectStorageConfig::from_bucket_uri(&name, endpoint.as_deref(), &region)
+            .expect("normalize storage")
+            .with_credentials(credentials);
+        let bucket = Bucket::open(storage, Some("cas-test")).expect("open bucket");
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

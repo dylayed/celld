@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! S3-compatible ownership effect adapter.
+//! Object-store ownership effect adapter.
 //!
 //! This module deliberately contains serialization, wall-clock sampling, SDK
 //! configuration and error classification only. Ownership decisions remain in
@@ -140,10 +140,12 @@ impl S3Ownership {
             .ok()
             .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
             .unwrap_or_else(|| "us-east-1".into());
-        Ok(Self::new(
-            Bucket::open(&bucket, endpoint.as_deref(), &region, None, None)?,
-            node,
-        ))
+        let storage = crate::storage_backend::ObjectStorageConfig::from_bucket_uri(
+            &bucket,
+            endpoint.as_deref(),
+            &region,
+        )?;
+        Ok(Self::new(Bucket::open(storage, None)?, node))
     }
 
     /// The lease lifetime this fleet renews on, used to decide which node
@@ -165,13 +167,13 @@ impl S3Ownership {
 
     pub async fn read_owner(&self, cell: &str) -> anyhow::Result<Option<OwnerRecord>> {
         let key = format!("cells/{cell}/own.json");
-        let Some((owner, etag)) = self.read_json::<OwnerWireOwned>(&key).await? else {
+        let Some((owner, version)) = self.read_json::<OwnerWireOwned>(&key).await? else {
             return Ok(None);
         };
         Ok(Some(OwnerRecord {
             node: (!owner.node.is_empty()).then_some(owner.node),
             epoch: owner.epoch,
-            etag,
+            version,
         }))
     }
 
@@ -196,13 +198,13 @@ impl S3Ownership {
         Ok(self
             .read_json_with::<NodeLeaseWire>(bucket, &key)
             .await?
-            .map(|(lease, etag)| NodeLeaseRecord {
+            .map(|(lease, version)| NodeLeaseRecord {
                 node: lease.node,
                 addr: lease.addr,
                 expires_ms: lease.expires_ms,
                 peer_protocol: lease.peer_protocol,
                 generation: lease.generation,
-                etag,
+                version,
             }))
     }
 
@@ -284,7 +286,11 @@ impl S3Ownership {
         }
         let key = format!("cells/{cell}/own.json");
         let body = serde_json::to_vec(&OwnerWire { node: "", epoch })?;
-        match self.bucket.put_cas(&key, body, Some(&current.etag)).await? {
+        match self
+            .bucket
+            .put_cas(&key, body, Some(&current.version))
+            .await?
+        {
             Some(_) => Ok(CasOutcome::Applied),
             None => Ok(CasOutcome::Rejected),
         }
@@ -301,11 +307,11 @@ impl S3Ownership {
             node: &self.node,
             epoch,
         })?;
-        let etag = match &guard {
+        let version = match &guard {
             CasGuard::Absent => None,
-            CasGuard::Match(etag) => Some(etag.as_str()),
+            CasGuard::Match(version) => Some(version.as_str()),
         };
-        match self.bucket.put_cas(&key, body, etag).await? {
+        match self.bucket.put_cas(&key, body, version).await? {
             Some(_) => Ok(CasOutcome::Applied),
             None => Ok(CasOutcome::Rejected),
         }
@@ -331,12 +337,12 @@ impl S3Ownership {
             generation: record.generation.clone(),
             load: process_load(&self.live),
         })?;
-        let etag = match &guard {
+        let version = match &guard {
             CasGuard::Absent => None,
-            CasGuard::Match(etag) => Some(etag.as_str()),
+            CasGuard::Match(version) => Some(version.as_str()),
         };
-        match self.lease_bucket.put_cas(&key, body, etag).await? {
-            Some(etag) => Ok(LeaseCasOutcome::Applied { etag }),
+        match self.lease_bucket.put_cas(&key, body, version).await? {
+            Some(version) => Ok(LeaseCasOutcome::Applied { version }),
             None => Ok(LeaseCasOutcome::Rejected),
         }
     }
@@ -353,12 +359,12 @@ impl S3Ownership {
         bucket: &Bucket,
         key: &str,
     ) -> anyhow::Result<Option<(T, String)>> {
-        let Some((bytes, etag)) = bucket.get(key).await? else {
+        let Some((bytes, version)) = bucket.get(key).await? else {
             return Ok(None);
         };
         let value = serde_json::from_slice(&bytes)
             .with_context(|| format!("decode s3://{}/{key}", bucket.name))?;
-        Ok(Some((value, etag)))
+        Ok(Some((value, version)))
     }
 }
 

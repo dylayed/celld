@@ -140,7 +140,7 @@ pub struct OwnerRecord {
     /// `None` is a deliberately released, fenced record. Epochs never reset.
     pub node: Option<NodeId>,
     pub epoch: Epoch,
-    pub etag: String,
+    pub version: String,
 }
 
 /// The routing and authority fields read from `nodes/<node>.json`.
@@ -157,7 +157,7 @@ pub struct NodeLeaseRecord {
     /// `ownership_index_generation`.
     pub generation: String,
     /// Object version observed by the read. Empty only in synthetic events.
-    pub etag: String,
+    pub version: String,
 }
 
 /// One advisory fleet-capacity observation returned by the storage shell.
@@ -298,7 +298,7 @@ pub struct RestoredAlarm {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeaseCasOutcome {
-    Applied { etag: String },
+    Applied { version: String },
     Rejected,
 }
 
@@ -1794,7 +1794,7 @@ impl State {
             expires_ms: now_ms.saturating_add(spec.ttl_ms),
             peer_protocol: spec.peer_protocol,
             generation: spec.generation.clone(),
-            etag: String::new(),
+            version: String::new(),
         };
         let pending = PendingNodeLease {
             spec,
@@ -1942,7 +1942,7 @@ impl State {
                     .is_some_and(|prior| same_node_lease(&record, &prior.record)) =>
             {
                 let mut prior = pending.prior.expect("checked above");
-                prior.record.etag = record.etag;
+                prior.record.version = record.version;
                 self.resume_node_lease_after_failure(prior, now_mono_ms, effects);
             }
             Ok(record) if pending.prior.is_some() => {
@@ -1962,7 +1962,7 @@ impl State {
                 // node replaces its prior process generation immediately. The
                 // ETag still serializes competing replacements, and a process
                 // which loses that CAS never becomes authoritative.
-                self.begin_node_lease_write(pending, CasGuard::Match(record.etag), effects);
+                self.begin_node_lease_write(pending, CasGuard::Match(record.version), effects);
             }
             Ok(None) => self.begin_node_lease_write(pending, CasGuard::Absent, effects),
         }
@@ -1992,9 +1992,9 @@ impl State {
             return;
         }
         match result {
-            Ok(LeaseCasOutcome::Applied { etag }) => {
+            Ok(LeaseCasOutcome::Applied { version }) => {
                 let mut record = pending.desired;
-                record.etag = etag;
+                record.version = version;
                 self.hold_node_lease(pending.spec, record, pending.prior, now_mono_ms, effects);
             }
             Ok(LeaseCasOutcome::Rejected) if pending.prior.is_some() => {
@@ -2223,9 +2223,9 @@ impl State {
                     expires_ms: now_ms.saturating_add(spec.ttl_ms),
                     peer_protocol: spec.peer_protocol,
                     generation: spec.generation.clone(),
-                    etag: String::new(),
+                    version: String::new(),
                 };
-                let guard = CasGuard::Match(prior.record.etag.clone());
+                let guard = CasGuard::Match(prior.record.version.clone());
                 self.begin_node_lease_write(
                     PendingNodeLease {
                         spec,
@@ -2814,7 +2814,7 @@ impl State {
                     &id,
                     &mut cell,
                     Activation::Claim(Claim {
-                        guard: CasGuard::Match(record.etag),
+                        guard: CasGuard::Match(record.version),
                         epoch,
                         takeover: false,
                         reconciles,
@@ -2828,7 +2828,7 @@ impl State {
                     &id,
                     &mut cell,
                     Claim {
-                        guard: CasGuard::Match(record.etag),
+                        guard: CasGuard::Match(record.version),
                         epoch,
                         takeover: true,
                         reconciles,
@@ -3073,7 +3073,7 @@ impl State {
                     id,
                     cell,
                     Activation::Claim(Claim {
-                        guard: CasGuard::Match(record.etag),
+                        guard: CasGuard::Match(record.version),
                         epoch,
                         takeover: true,
                         reconciles: 0,

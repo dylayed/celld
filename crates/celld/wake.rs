@@ -76,7 +76,7 @@ pub async fn try_hold_waker(bucket: &Bucket, node: &str, now_ms: i64, ttl_ms: i6
             bucket.put_cas(KEY, body(now_ms + ttl_ms), None).await,
             Ok(Some(_))
         ),
-        Ok(Some((bytes, etag))) => {
+        Ok(Some((bytes, version))) => {
             let text = String::from_utf8_lossy(&bytes);
             let held_by_us = text.contains(&format!("\"node\":{node:?}"));
             let expires = text
@@ -87,7 +87,7 @@ pub async fn try_hold_waker(bucket: &Bucket, node: &str, now_ms: i64, ttl_ms: i6
             if celld_logic::wake::waker_may_claim(held_by_us, expires, now_ms) {
                 matches!(
                     bucket
-                        .put_cas(KEY, body(now_ms + ttl_ms), Some(&etag))
+                        .put_cas(KEY, body(now_ms + ttl_ms), Some(&version))
                         .await,
                     Ok(Some(_))
                 )

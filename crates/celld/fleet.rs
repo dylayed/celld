@@ -5,6 +5,7 @@
 use crate::bucket::Bucket;
 use crate::deploy;
 use crate::js::WorkerConfigOptions;
+use crate::storage_backend::{ObjectStorageConfig, StaticCredentials};
 use crate::protocol::{DeployPointer, Manifest};
 use anyhow::{bail, Context};
 use serde::Deserialize;
@@ -12,8 +13,59 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::info;
 
-pub fn s3_client(bucket: &str, endpoint: Option<&str>, region: &str) -> anyhow::Result<Bucket> {
-    s3_client_with_credentials(bucket, endpoint, region, None)
+pub fn normalize_storage(
+    bucket: &str,
+    endpoint: Option<&str>,
+    region: &str,
+    managed: Option<&crate::control_plane::ManagedStorageConfig>,
+) -> anyhow::Result<ObjectStorageConfig> {
+    if let Some(managed) = managed {
+        let name = bucket.trim_start_matches("s3://");
+        return ObjectStorageConfig::managed(
+            name,
+            managed.region.clone(),
+            managed.endpoint.clone(),
+            StaticCredentials {
+                access_key_id: managed.access_key_id.clone(),
+                secret_access_key: managed.secret_access_key.clone(),
+                session_token: managed.session_token.clone(),
+            },
+        );
+    }
+
+    ObjectStorageConfig::from_bucket_uri(bucket, endpoint, region)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_storage_reaches_ltx_config() {
+        let managed = crate::control_plane::ManagedStorageConfig {
+            bucket: "managed-bucket".into(),
+            endpoint: "https://managed.example".into(),
+            region: "managed-region".into(),
+            access_key_id: "managed-access-key".into(),
+            secret_access_key: "managed-secret-key".into(),
+            session_token: Some("managed-session-token".into()),
+        };
+        let storage = normalize_storage(&managed.bucket, None, "ignored", Some(&managed)).unwrap();
+        let replica = storage.replica_config("replicas/epoch".into());
+
+        assert_eq!(replica.bucket, "managed-bucket");
+        assert_eq!(replica.path, "replicas/epoch");
+        assert_eq!(replica.endpoint, "https://managed.example");
+        assert_eq!(replica.region, "managed-region");
+        assert_eq!(replica.access_key_id, "managed-access-key");
+        assert_eq!(replica.secret_access_key, "managed-secret-key");
+        assert_eq!(replica.session_token, "managed-session-token");
+        assert!(replica.force_path_style);
+    }
+}
+
+pub fn s3_client(backend: &ObjectStorageConfig) -> anyhow::Result<Bucket> {
+    Bucket::open(backend.clone(), None)
 }
 
 /// Build the authority-heartbeat client on its own HTTP connection pool.
@@ -23,36 +75,9 @@ pub fn s3_client(bucket: &str, endpoint: Option<&str>, region: &str) -> anyhow::
 /// dedicated instance keeps the safety lane isolated, and the `celld-lease`
 /// app tag labels it in black-box storage traces.
 pub fn s3_lease_client_with_credentials(
-    bucket: &str,
-    endpoint: Option<&str>,
-    region: &str,
-    managed: Option<&crate::control_plane::ManagedStorageConfig>,
+    backend: &ObjectStorageConfig,
 ) -> anyhow::Result<Bucket> {
-    open(bucket, endpoint, region, managed, Some("celld-lease"))
-}
-
-pub fn s3_client_with_credentials(
-    bucket: &str,
-    endpoint: Option<&str>,
-    region: &str,
-    managed: Option<&crate::control_plane::ManagedStorageConfig>,
-) -> anyhow::Result<Bucket> {
-    open(bucket, endpoint, region, managed, None)
-}
-
-fn open(
-    bucket: &str,
-    endpoint: Option<&str>,
-    region: &str,
-    managed: Option<&crate::control_plane::ManagedStorageConfig>,
-    app: Option<&str>,
-) -> anyhow::Result<Bucket> {
-    let credentials = managed.map(|managed| crate::bucket::StaticCredentials {
-        access_key_id: managed.access_key_id.clone(),
-        secret_access_key: managed.secret_access_key.clone(),
-        session_token: managed.session_token.clone(),
-    });
-    Bucket::open(bucket, endpoint, region, credentials, app)
+    Bucket::open(backend.clone(), Some("celld-lease"))
 }
 
 pub async fn validate_bucket(bucket: &Bucket) -> anyhow::Result<()> {
@@ -323,7 +348,8 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
         .or_else(|| env("AWS_REGION"))
         .or_else(|| env("AWS_DEFAULT_REGION"))
         .unwrap_or_else(|| "us-east-1".to_string());
-    let store = s3_client(&bucket, options.endpoint.as_deref(), &region)?;
+    let storage = normalize_storage(&bucket, options.endpoint.as_deref(), &region, None)?;
+    let store = s3_client(&storage)?;
     validate_bucket(&store).await?;
     let started = std::time::Instant::now();
     deploy::write(&store, &built).await?;
