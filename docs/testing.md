@@ -61,7 +61,7 @@ A suite that stays green against a broken protocol is a broken suite.
 
 ## Live fleets: what simulation cannot see
 
-Simulation cannot see the real S3 tail latency, the real kernel and
+Simulation cannot see the real object-storage tail latency, the real kernel and
 filesystem behavior, or V8 under memory pressure. The third layer is
 therefore a permanent fleet lab: standard VMs from standard providers,
 and a real bucket. The workloads rotate: chat rooms under many WebSocket

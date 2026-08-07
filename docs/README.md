@@ -1,9 +1,9 @@
 # celld documentation
 
 celld is a stateful distributed system. It runs server-side JavaScript on
-your machines and keeps all shared data in an S3-compatible bucket that
-you own. The JavaScript API is the same API that Cloudflare Workers and
-Durable Objects supply.
+your machines and keeps all shared data in an S3-compatible or Google Cloud
+Storage bucket that you own. The JavaScript API is the same API that Cloudflare
+Workers and Durable Objects supply.
 
 In Cloudflare terms, a cell is a Durable Object: a small server with a
 name and a private SQLite database. You make one cell for each user, each
@@ -16,8 +16,8 @@ never interleaves at all. The data in a cell therefore stays consistent.
 Cells share no database, and the application divides into cells from the
 start.
 
-An idle cell hibernates to the bucket, where it is only an object in S3
-and costs almost zero. A resident cell is in memory. One 8 GB node holds
+An idle cell hibernates to the bucket, where it is only an object in object
+storage and costs almost zero. A resident cell is in memory. One 8 GB node holds
 1,000 resident cells, so one resident cell costs approximately $0.05 each
 month.
 
@@ -64,9 +64,8 @@ correct, run `gh attestation verify <asset> --repo denoland/celld`.
 
 ## Configure object storage
 
-celld uses the standard AWS credential chain. For Cloudflare R2, do these
-steps. Create a bucket. Create an S3 API token that has access to that
-bucket. Then set these variables:
+For S3-compatible storage, celld uses the standard AWS credential chain. For
+Cloudflare R2, create a bucket and an S3 API token scoped to it, then set:
 
 ```sh
 export AWS_ACCESS_KEY_ID=...
@@ -79,6 +78,18 @@ export CELLD_BUCKET=s3://YOUR-BUCKET
 The bucket credentials give full control of the fleet. Keep them safe. The
 bucket contains the deployments, the SQLite replicas, the ownership
 records, the node leases, and the peer-authentication secret.
+
+For GCS, use an exact `gs://BUCKET` target without `S3_ENDPOINT`. Celld uses
+Application Default Credentials: set `GOOGLE_APPLICATION_CREDENTIALS` to an
+authorized-user or service-account ADC file, or use the metadata identity on
+GCE or Cloud Run. Grant the identity `roles/storage.objectUser` on the fleet
+bucket. `--endpoint` is invalid with GCS; `--region` is unused and omitted in
+the GCS examples:
+
+```sh
+celld deploy . --bucket gs://YOUR-BUCKET
+celld --bucket gs://YOUR-BUCKET
+```
 
 ## Deploy an application
 
@@ -163,9 +174,10 @@ For the full list, run `celld -h`. This table shows the primary settings:
 | variable | purpose |
 | --- | --- |
 | `CELLD_BUCKET` | The fleet bucket. The same as `--bucket` |
-| `S3_ENDPOINT` | The S3-compatible endpoint. The same as `--endpoint` |
-| `AWS_REGION`, `AWS_DEFAULT_REGION` | The storage region |
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Explicit AWS credentials. The standard AWS credential chain is also available |
+| `S3_ENDPOINT` | The S3-compatible endpoint. The same as `--endpoint`; invalid with GCS |
+| `AWS_REGION`, `AWS_DEFAULT_REGION` | The S3 storage region |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Explicit S3 credentials. The standard AWS credential chain is also available |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Path to an ADC JSON file for GCS |
 | `CELLD_ADDR` | The listener. The same as `--listen` |
 | `CELLD_ADVERTISE` | The address that peers can reach. The same as `--advertise` |
 | `CELLD_UNSAFE_PUBLIC_ADVERTISE` | Set to `on` to permit a public peer IP |

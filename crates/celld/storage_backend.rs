@@ -1,7 +1,8 @@
 //! Celld's daemon-wide object-storage policy.
 
-use anyhow::Context;
+use anyhow::{ensure, Context};
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::{ClientOptions, ObjectMeta, ObjectStore, PutResult, RetryConfig};
 use std::sync::Arc;
 
@@ -14,11 +15,18 @@ pub(crate) struct StaticCredentials {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ObjectStorageConfig {
+    provider: Provider,
     bucket: String,
     region: String,
     endpoint: Option<String>,
     credentials: Option<StaticCredentials>,
     force_path_style: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provider {
+    S3,
+    Gcs,
 }
 
 impl ObjectStorageConfig {
@@ -27,6 +35,27 @@ impl ObjectStorageConfig {
         endpoint: Option<&str>,
         region: &str,
     ) -> anyhow::Result<Self> {
+        if let Some(bucket) = bucket.strip_prefix("gs://") {
+            ensure!(
+                endpoint.is_none(),
+                "--endpoint is S3-only and conflicts with gs:// storage"
+            );
+            ensure!(
+                !bucket.is_empty() && !bucket.contains(['/', '?', '#']),
+                "gs:// storage target must contain only a bucket name"
+            );
+            return Ok(Self {
+                provider: Provider::Gcs,
+                bucket: bucket.into(),
+                region: String::new(),
+                endpoint: None,
+                credentials: None,
+                force_path_style: false,
+            });
+        }
+        if let Some((scheme, _)) = bucket.split_once("://") {
+            ensure!(scheme == "s3", "unsupported storage scheme {scheme}://");
+        }
         Self::s3(bucket, endpoint, region, None)
     }
 
@@ -37,7 +66,9 @@ impl ObjectStorageConfig {
         credentials: Option<StaticCredentials>,
     ) -> anyhow::Result<Self> {
         let bucket = bucket.trim_start_matches("s3://");
+        ensure!(!bucket.is_empty(), "s3: bucket name is required");
         Ok(Self {
+            provider: Provider::S3,
             bucket: bucket.into(),
             region: region.into(),
             endpoint: endpoint.map(Into::into),
@@ -55,17 +86,38 @@ impl ObjectStorageConfig {
         Self::s3(bucket, Some(&endpoint), &region, Some(credentials))
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_credentials(mut self, credentials: StaticCredentials) -> Self {
-        self.credentials = Some(credentials);
-        self
-    }
-
     pub(crate) fn bucket(&self) -> &str {
         &self.bucket
     }
 
-    fn runtime_builder(&self) -> AmazonS3Builder {
+    pub(crate) fn scheme(&self) -> &'static str {
+        match self.provider {
+            Provider::S3 => "s3",
+            Provider::Gcs => "gs",
+        }
+    }
+
+    pub(crate) fn uri(&self) -> String {
+        format!("{}://{}", self.scheme(), self.bucket)
+    }
+
+    pub(crate) fn enrollment_bucket(&self) -> String {
+        match self.provider {
+            Provider::S3 => self.bucket.clone(),
+            Provider::Gcs => self.uri(),
+        }
+    }
+
+    pub(crate) fn object_uri(&self, path: &str) -> String {
+        format!(
+            "{}://{}/{}",
+            self.scheme(),
+            self.bucket,
+            path.trim_start_matches('/')
+        )
+    }
+
+    fn runtime_s3_builder(&self) -> AmazonS3Builder {
         let mut builder = AmazonS3Builder::from_env()
             .with_bucket_name(&self.bucket)
             .with_region(&self.region)
@@ -89,10 +141,31 @@ impl ObjectStorageConfig {
         builder
     }
 
+    fn runtime_gcs_builder(&self) -> GoogleCloudStorageBuilder {
+        // Honor the standard ADC file override without importing unrelated
+        // object_store-specific environment configuration.
+        let mut builder = GoogleCloudStorageBuilder::new();
+        if let Ok(path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
+            if !path.is_empty() {
+                builder = builder.with_application_credentials(path);
+            }
+        }
+        builder.with_bucket_name(&self.bucket)
+    }
+
     pub(crate) fn build_ltx_store(&self) -> anyhow::Result<Arc<dyn ObjectStore>> {
-        self.replica_config(String::new())
-            .build_store()
-            .map_err(anyhow::Error::from)
+        match self.provider {
+            Provider::S3 => self
+                .replica_config(String::new())
+                .build_store()
+                .map_err(anyhow::Error::from),
+            Provider::Gcs => self
+                .runtime_gcs_builder()
+                .with_retry(RetryConfig::default())
+                .build()
+                .map(|store| Arc::new(store) as Arc<dyn ObjectStore>)
+                .context("build shared GCS object store"),
+        }
     }
 
     pub(crate) fn build_bucket_stores(
@@ -101,38 +174,71 @@ impl ObjectStorageConfig {
         ordinary: RetryConfig,
         cas: RetryConfig,
     ) -> anyhow::Result<(Arc<dyn ObjectStore>, Arc<dyn ObjectStore>)> {
-        let builder = self
-            .runtime_builder()
-            .with_client_options(options)
-            .with_conditional_put(S3ConditionalPut::ETagMatch);
-        let store = builder
-            .clone()
-            .with_retry(ordinary)
-            .build()
-            .context("build s3 client")?;
-        let cas_store = builder
-            .with_retry(cas)
-            .build()
-            .context("build s3 cas client")?;
-        Ok((Arc::new(store), Arc::new(cas_store)))
-    }
-
-    pub(crate) fn object_version(&self, meta: &ObjectMeta) -> String {
-        meta.e_tag.clone().unwrap_or_default()
-    }
-    pub(crate) fn put_result_version(&self, result: PutResult) -> String {
-        result.e_tag.unwrap_or_default()
-    }
-    pub(crate) fn update_version(&self, version: &str) -> object_store::UpdateVersion {
-        object_store::UpdateVersion {
-            e_tag: Some(version.into()),
-            version: None,
+        match self.provider {
+            Provider::S3 => {
+                let builder = self
+                    .runtime_s3_builder()
+                    .with_client_options(options)
+                    .with_conditional_put(S3ConditionalPut::ETagMatch);
+                let store = builder
+                    .clone()
+                    .with_retry(ordinary)
+                    .build()
+                    .context("build s3 client")?;
+                let cas_store = builder
+                    .with_retry(cas)
+                    .build()
+                    .context("build s3 cas client")?;
+                Ok((Arc::new(store), Arc::new(cas_store)))
+            }
+            Provider::Gcs => {
+                let builder = self.runtime_gcs_builder().with_client_options(options);
+                let store = builder
+                    .clone()
+                    .with_retry(ordinary)
+                    .build()
+                    .context("build gcs client")?;
+                let cas_store = builder
+                    .with_retry(cas)
+                    .build()
+                    .context("build gcs cas client")?;
+                Ok((Arc::new(store), Arc::new(cas_store)))
+            }
         }
     }
 
-    pub(crate) fn replica_config(&self, path: String) -> celld_ltx::ObjectStoreConfig {
+    pub(crate) fn object_version(&self, meta: &ObjectMeta) -> String {
+        match self.provider {
+            Provider::S3 => meta.e_tag.clone(),
+            Provider::Gcs => meta.version.clone(),
+        }
+        .unwrap_or_default()
+    }
+
+    pub(crate) fn put_result_version(&self, result: PutResult) -> String {
+        match self.provider {
+            Provider::S3 => result.e_tag,
+            Provider::Gcs => result.version,
+        }
+        .unwrap_or_default()
+    }
+
+    pub(crate) fn update_version(&self, version: &str) -> object_store::UpdateVersion {
+        match self.provider {
+            Provider::S3 => object_store::UpdateVersion {
+                e_tag: Some(version.into()),
+                version: None,
+            },
+            Provider::Gcs => object_store::UpdateVersion {
+                e_tag: None,
+                version: Some(version.into()),
+            },
+        }
+    }
+
+    fn s3_replica_credentials(&self) -> (String, String, String) {
         let env = |name| std::env::var(name).ok().filter(|value| !value.is_empty());
-        let (access_key_id, secret_access_key, session_token) = match &self.credentials {
+        match &self.credentials {
             None => (
                 env("AWS_ACCESS_KEY_ID").unwrap_or_default(),
                 env("AWS_SECRET_ACCESS_KEY").unwrap_or_default(),
@@ -157,6 +263,13 @@ impl ObjectStorageConfig {
                     .or_else(|| env("AWS_SESSION_TOKEN"))
                     .unwrap_or_default(),
             ),
+        }
+    }
+
+    pub(crate) fn replica_config(&self, path: String) -> celld_ltx::ObjectStoreConfig {
+        let (access_key_id, secret_access_key, session_token) = match self.provider {
+            Provider::S3 => self.s3_replica_credentials(),
+            Provider::Gcs => (String::new(), String::new(), String::new()),
         };
         celld_ltx::ObjectStoreConfig {
             bucket: self.bucket.clone(),
@@ -180,18 +293,78 @@ impl ObjectStorageConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
+
+    fn meta(e_tag: Option<&str>, version: Option<&str>) -> ObjectMeta {
+        ObjectMeta {
+            location: "test".into(),
+            last_modified: SystemTime::UNIX_EPOCH.into(),
+            size: 0,
+            e_tag: e_tag.map(Into::into),
+            version: version.map(Into::into),
+        }
+    }
+
     #[test]
     fn parses_s3_and_bare_identically() {
-        assert!(
-            ObjectStorageConfig::from_bucket_uri("bucket", None, "r").unwrap()
-                == ObjectStorageConfig::from_bucket_uri("s3://bucket", None, "r").unwrap()
-        );
+        let bare = ObjectStorageConfig::from_bucket_uri("bucket", None, "r").unwrap();
+        let prefixed =
+            ObjectStorageConfig::from_bucket_uri("s3://bucket", None, "r").unwrap();
+        let repeated =
+            ObjectStorageConfig::from_bucket_uri("s3://s3://bucket", None, "r").unwrap();
+        assert!(bare == prefixed);
+        assert!(bare == repeated);
+        assert_eq!(bare.enrollment_bucket(), "bucket");
     }
+
+    #[test]
+    fn rejects_empty_bucket() {
+        assert!(ObjectStorageConfig::from_bucket_uri("s3://", None, "r").is_err());
+    }
+
+    #[test]
+    fn parses_strict_gcs_uri_and_conflicts() {
+        let gcs = ObjectStorageConfig::from_bucket_uri("gs://bucket", None, "ignored").unwrap();
+        assert_eq!(gcs.scheme(), "gs");
+        assert_eq!(gcs.enrollment_bucket(), "gs://bucket");
+        for uri in [
+            "gs://bucket/path",
+            "gs://bucket/",
+            "gs://bucket?x",
+            "gs://bucket#x",
+        ] {
+            assert!(ObjectStorageConfig::from_bucket_uri(uri, None, "r").is_err());
+        }
+        let error =
+            ObjectStorageConfig::from_bucket_uri("gs://bucket", Some("https://example"), "r")
+                .err()
+                .unwrap()
+                .to_string();
+        assert!(error.contains("--endpoint is S3-only"));
+        assert!(ObjectStorageConfig::from_bucket_uri("azure://bucket", None, "r").is_err());
+    }
+
     #[test]
     fn maps_etag_version() {
         let storage = ObjectStorageConfig::from_bucket_uri("b", None, "r").unwrap();
         let update = storage.update_version("tag");
         assert_eq!(update.e_tag.as_deref(), Some("tag"));
         assert!(update.version.is_none());
+    }
+
+    #[test]
+    fn maps_gcs_generation_version() {
+        let gcs = ObjectStorageConfig::from_bucket_uri("gs://b", None, "r").unwrap();
+        assert_eq!(gcs.object_version(&meta(Some("ignored"), Some("42"))), "42");
+        assert_eq!(
+            gcs.put_result_version(PutResult {
+                e_tag: Some("ignored".into()),
+                version: Some("43".into()),
+            }),
+            "43"
+        );
+        let update = gcs.update_version("44");
+        assert_eq!(update.version.as_deref(), Some("44"));
+        assert!(update.e_tag.is_none());
     }
 }

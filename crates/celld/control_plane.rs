@@ -759,12 +759,12 @@ pub type PresenceSnapshotSource = Arc<dyn Fn() -> PresenceSnapshotFuture + Send 
 /// celld-logic. The control-plane adapter cannot mutate lifecycle state or
 /// maintain its own resident inventory.
 pub struct PresenceRuntime {
-    pub s3: Bucket,
+    pub storage: Bucket,
     pub replication: Option<crate::runtime::Replication>,
     pub node_session_id: String,
     pub advertise: String,
     pub listen: String,
-    /// Credential version used to construct S3, lease, replication, explorer,
+    /// Credential version used to construct storage, lease, replication, explorer,
     /// and deployment adapters. This intentionally comes from the same config
     /// snapshot as those credentials, not from a later presence-agent read.
     pub credential_version: u64,
@@ -1009,7 +1009,7 @@ async fn presence_session(
                                 if poll_and_apply(
                                     &client,
                                     config,
-                                    &runtime.s3,
+                                    &runtime.storage,
                                 ).await?.is_some() && restart_on_deployment_enabled() {
                                     restart_for_deployment();
                                 }
@@ -1080,8 +1080,8 @@ fn lazy_lease_shadow_json(batch: &celld_logic::LeaseLifecycleShadowBatch) -> ser
 /// into the core or changes whether the node serves.
 async fn lease_shadow_observation(runtime: &PresenceRuntime) -> serde_json::Value {
     let checked_at_ms = crate::ownership_store::now_ms();
-    let ownership = crate::ownership_store::S3Ownership::new(
-        runtime.s3.clone(),
+    let ownership = crate::ownership_store::ObjectStoreOwnership::new(
+        runtime.storage.clone(),
         runtime.node_session_id.clone(),
     );
     match ownership.read_node_lease(&runtime.node_session_id).await {
@@ -1134,7 +1134,7 @@ async fn handle_explorer_request(
                 }
                 _ => return explorer_error(request_id, "invalid_request"),
             };
-            list_durable_cells(&runtime.s3, cursor).await
+            list_durable_cells(&runtime.storage, cursor).await
         }
         Some("inspect_cell") => {
             let Some(cell) = message

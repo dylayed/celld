@@ -326,6 +326,6 @@ async fn read_node(bucket: &Bucket, key: &str) -> anyhow::Result<Option<(NodeWir
         return Ok(None);
     };
     let record = serde_json::from_slice(&bytes)
-        .with_context(|| format!("decode s3://{}/{key}", bucket.name))?;
+        .with_context(|| format!("decode {}", bucket.object_uri(key)))?;
     Ok(Some((record, version)))
 }

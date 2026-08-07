@@ -6,13 +6,15 @@ receive fixes.
 
 ## Trust starts at your bucket
 
-The S3-compatible bucket is the root of authority for the fleet. The
-ownership of each cell is a compare-and-swap lease in that bucket, which
-also holds the deployments, the cell state, the node leases, and the
+The configured S3-compatible or GCS bucket is the root of authority for the
+fleet. The ownership of each cell is a compare-and-swap lease in that bucket,
+which also holds the deployments, the cell state, the node leases, and the
 shared peer-authentication secret. The person who holds the bucket
 credentials controls the fleet, so handle the credentials as
 administrator access: give each credential the scope of one fleet bucket
 only, and replace a credential if you think that others know it.
+For GCS, grant the node's ADC identity `roles/storage.objectUser` on only
+that bucket; GCE and Cloud Run can supply this identity through metadata.
 
 ## Peers authenticate, but do not encrypt
 

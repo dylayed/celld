@@ -11,9 +11,12 @@ The boundaries of the current alpha:
 - The fleet bucket is the administrative authority, so give its
   credentials a narrow scope; celld does not make shared object-store
   credentials safe.
-- The bucket credentials come from the `AWS_*` environment or from
-  explicit managed credentials, which includes instance metadata and web
-  identity tokens. celld does not read `~/.aws` profiles or SSO logins.
+- S3 credentials come from the `AWS_*` environment or from explicit managed
+  credentials, which includes instance metadata and web identity tokens. celld
+  does not read `~/.aws` profiles or SSO logins.
+- GCS requires an exact `gs://BUCKET` target and Application Default
+  Credentials. Bucket prefixes, custom endpoints/emulators, and transparent
+  migration of an existing fleet between S3 and GCS are not supported.
 - The [Cloudflare compatibility](cloudflare-compat.md) page shows what
   celld runs of the Workers platform: the available APIs, the deploy
   contract, and what is out of scope (KV, R2, `wrangler.toml`, routes).
