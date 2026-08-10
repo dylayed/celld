@@ -4,8 +4,8 @@ Self-hosted, distributed **Durable Objects**.
 
 celld is an open-source daemon that runs Cloudflare Workers and Durable
 Objects on your own machines. Each object is its own SQLite database,
-addressed by name and replicated to an
-S3-compatible bucket you own; nodes coordinate through that bucket alone, with
+addressed by name and replicated to an S3-compatible or Google Cloud Storage
+bucket you own; nodes coordinate through that bucket alone, with
 no control plane or consensus. Because every object is its own small database,
 applications shard by construction — the contention and blast-radius failures
 of one shared database are designed out, not managed. Idle cells hibernate to
@@ -15,7 +15,7 @@ nearly nothing. Learn more at [celld.dev](https://celld.dev) or read the
 ## How it works
 
 Every `celld` node embeds V8 and executes Wrangler bundles. The fleet shares an
-S3-compatible bucket containing deployments, cell state, and small ownership
+object-storage bucket containing deployments, cell state, and small ownership
 records. Object-storage compare-and-swap ensures that exactly one node owns a
 cell at a time, without a membership protocol, failure detector, or consensus
 service.
@@ -93,7 +93,29 @@ celld \
 ```
 
 Use `--endpoint` for another S3-compatible service and `--region` when it
-cannot be inferred. A fleet runs one application, and every node loads its
+cannot be inferred. A bare bucket name continues to mean S3.
+
+### Google Cloud Storage
+
+Use an exact `gs://BUCKET` target for GCS (prefixes, query strings, fragments,
+and custom endpoints are not supported):
+
+```sh
+celld deploy . --bucket gs://my-cells-bucket
+celld --bucket gs://my-cells-bucket --listen 0.0.0.0:8080 \
+  --advertise 10.0.0.12:8080
+celld diagnose --bucket gs://my-cells-bucket
+```
+
+GCS authentication uses the ADC sources implemented by `object_store` 0.11.2:
+an authorized-user or service-account ADC file (including the path in
+`GOOGLE_APPLICATION_CREDENTIALS`), then the GCE metadata identity used by GCE
+and Cloud Run. Grant that identity `roles/storage.objectUser` on the fleet
+bucket so it can list, read, create, update, and delete objects. Celld fencing
+uses GCS generation preconditions for compare-and-swap; migrating an existing
+fleet between S3 and GCS is not supported.
+
+A fleet runs one application, and every node loads its
 latest successfully committed deployment from `deploy/current.json`. Run
 `celld --help` for the complete command line.
 Deployment objects use the documented types in `crates/celld/protocol.rs`. `celld

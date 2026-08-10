@@ -56,11 +56,13 @@ pub struct Options {
 pub fn print_help() {
     println!(
         "celld deploy — build a Worker with esbuild and write it to the fleet bucket\n\n\
-USAGE:\n  celld deploy [PROJECT] --bucket s3://NAME [OPTIONS]\n\n\
+USAGE:\n  celld deploy [PROJECT] --bucket URI [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket s3://NAME     Fleet bucket; defaults to CELLD_BUCKET\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  -h, --help             Show this help\n\n\
-Credentials come from the standard AWS credential chain.\n\n\
+OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket URI           Fleet bucket; defaults to CELLD_BUCKET\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        S3 region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  -h, --help             Show this help\n\n\
+URI is s3://BUCKET, gs://BUCKET, or a bare S3 bucket name.\n\n\
+Credentials come from the standard AWS chain or Google Application Default\n\
+Credentials (`GOOGLE_APPLICATION_CREDENTIALS` overrides the ADC file path).\n\n\
 Worker projects require `esbuild` on PATH; asset-only projects do not. Static\n\
 assets, service bindings, and string vars are supported. Routes are not; use\n\
 Wrangler for route configuration.\n\
@@ -91,7 +93,7 @@ pub fn options_from_arguments(
             }
             "--bucket" => {
                 let value = arguments.next().context("--bucket requires a value")?;
-                options.bucket = Some(value.trim_start_matches("s3://").to_string());
+                options.bucket = Some(value);
             }
             "--endpoint" => {
                 options.endpoint = Some(arguments.next().context("--endpoint requires a value")?);
@@ -399,9 +401,9 @@ async fn put_pointer(bucket: &Bucket, key: &str, body: Vec<u8>) -> anyhow::Resul
     match bucket.put_cas(key, body, etag.as_deref()).await {
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err(anyhow!(
-            "write s3://{}/{key} lost a race\n\
+            "write {} lost a race\n\
              Another deploy may have landed first; re-run `celld deploy`.",
-            bucket.name
+            bucket.object_uri(key)
         )),
         Err(error) => {
             Err(error.context("Another deploy may have landed first; re-run `celld deploy`."))

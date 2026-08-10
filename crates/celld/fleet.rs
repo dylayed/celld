@@ -20,6 +20,12 @@ pub fn normalize_storage(
     managed: Option<&crate::control_plane::ManagedStorageConfig>,
 ) -> anyhow::Result<ObjectStorageConfig> {
     if let Some(managed) = managed {
+        if let Some((scheme, _)) = bucket.split_once("://") {
+            anyhow::ensure!(
+                scheme == "s3",
+                "managed R2 storage is S3 and does not support {scheme}://"
+            );
+        }
         let name = bucket.trim_start_matches("s3://");
         return ObjectStorageConfig::managed(
             name,
@@ -34,6 +40,39 @@ pub fn normalize_storage(
     }
 
     ObjectStorageConfig::from_bucket_uri(bucket, endpoint, region)
+}
+
+pub fn normalize_byo_storage(
+    bucket: &str,
+    endpoint: Option<&str>,
+    region: &str,
+) -> anyhow::Result<(ObjectStorageConfig, crate::control_plane::ByoStorageConfig)> {
+    let storage = normalize_storage(bucket, endpoint, region, None)?;
+    let (endpoint, region) = if storage.scheme() == "gs" {
+        (None, String::new())
+    } else {
+        (endpoint.map(Into::into), region.into())
+    };
+    let config = crate::control_plane::ByoStorageConfig {
+        bucket: storage.enrollment_bucket(),
+        endpoint,
+        region,
+    };
+    Ok((storage, config))
+}
+
+pub fn storage_client(backend: &ObjectStorageConfig) -> anyhow::Result<Bucket> {
+    Bucket::open(backend.clone(), None)
+}
+
+/// Build the authority-heartbeat client on its own HTTP connection pool.
+///
+/// Node lease traffic must not queue behind ordinary ownership, deployment,
+/// or replica requests. Every `Bucket::open` builds its own transport, so a
+/// dedicated instance keeps the safety lane isolated, and the `celld-lease`
+/// app tag labels it in black-box storage traces.
+pub fn lease_storage_client(backend: &ObjectStorageConfig) -> anyhow::Result<Bucket> {
+    Bucket::open(backend.clone(), Some("celld-lease"))
 }
 
 #[cfg(test)]
@@ -62,29 +101,37 @@ mod tests {
         assert_eq!(replica.session_token, "managed-session-token");
         assert!(replica.force_path_style);
     }
-}
 
-pub fn s3_client(backend: &ObjectStorageConfig) -> anyhow::Result<Bucket> {
-    Bucket::open(backend.clone(), None)
-}
+    #[test]
+    fn canonicalizes_byo_storage_before_enrollment() {
+        let s3_endpoint = "https://s3.example";
+        let s3_region = "us-east-1";
+        for bucket in ["bucket", "s3://bucket", "s3://s3://bucket"] {
+            let (_, config) = normalize_byo_storage(bucket, Some(s3_endpoint), s3_region).unwrap();
+            assert_eq!(config.bucket, "bucket");
+            assert_eq!(config.endpoint.as_deref(), Some(s3_endpoint));
+            assert_eq!(config.region, s3_region);
+        }
 
-/// Build the authority-heartbeat client on its own HTTP connection pool.
-///
-/// Node lease traffic must not queue behind ordinary ownership, deployment,
-/// or replica requests. Every `Bucket::open` builds its own transport, so a
-/// dedicated instance keeps the safety lane isolated, and the `celld-lease`
-/// app tag labels it in black-box storage traces.
-pub fn s3_lease_client_with_credentials(
-    backend: &ObjectStorageConfig,
-) -> anyhow::Result<Bucket> {
-    Bucket::open(backend.clone(), Some("celld-lease"))
+        let irrelevant_aws_region = "us-west-2";
+        let (gcs_storage, gcs_config) =
+            normalize_byo_storage("gs://bucket", None, irrelevant_aws_region).unwrap();
+        let canonical_gcs_storage = normalize_storage("gs://bucket", None, "", None).unwrap();
+        assert!(gcs_storage == canonical_gcs_storage);
+        assert_eq!(gcs_config.bucket, "gs://bucket");
+        assert!(gcs_config.endpoint.is_none());
+        assert!(gcs_config.region.is_empty());
+        assert!(normalize_byo_storage("gs://bucket/path", None, "ignored").is_err());
+        assert!(normalize_byo_storage("gs://bucket", Some(""), "ignored").is_err());
+        assert!(normalize_byo_storage("azure://bucket", None, "ignored").is_err());
+    }
 }
 
 pub async fn validate_bucket(bucket: &Bucket) -> anyhow::Result<()> {
     bucket
         .validate()
         .await
-        .with_context(|| format!("bucket unavailable or inaccessible: s3://{}", bucket.name))
+        .with_context(|| format!("bucket unavailable or inaccessible: {}", bucket.uri()))
 }
 
 /// Validate storage issued by the Managed Control Plane and preserve the
@@ -118,13 +165,13 @@ async fn validate_managed_bucket_once(bucket: &Bucket, report: bool) -> anyhow::
                     crate::control_plane::ManagedRuntimeState::CredentialRevoked,
                 );
                 bail!(
-                    "managed storage credential was rejected or revoked for s3://{}",
-                    bucket.name
+                    "managed storage credential was rejected or revoked for {}",
+                    bucket.uri()
                 );
             }
             bail!(
-                "managed storage credential was not accepted yet for s3://{}",
-                bucket.name
+                "managed storage credential was not accepted yet for {}",
+                bucket.uri()
             );
         }
         Err(error) => {
@@ -133,9 +180,8 @@ async fn validate_managed_bucket_once(bucket: &Bucket, report: bool) -> anyhow::
                     crate::control_plane::ManagedRuntimeState::BucketUnavailable,
                 );
             }
-            Err(error).with_context(|| {
-                format!("bucket unavailable or inaccessible: s3://{}", bucket.name)
-            })
+            Err(error)
+                .with_context(|| format!("bucket unavailable or inaccessible: {}", bucket.uri()))
         }
     }
 }
@@ -159,7 +205,7 @@ pub async fn diagnose(
     unsafe_public_advertise: bool,
 ) -> anyhow::Result<()> {
     validate_bucket(bucket).await?;
-    println!("ok bucket s3://{}", bucket.name);
+    println!("ok bucket {}", bucket.uri());
 
     let enumerated = peers.is_empty();
     let peers = if enumerated {
@@ -272,7 +318,7 @@ pub async fn diagnose(
 async fn diagnostic_node(bucket: &Bucket, peer: &str) -> anyhow::Result<Option<DiagnosticNode>> {
     let key = format!("nodes/{peer}.json");
     let node: DiagnosticNode = serde_json::from_str(&get_string(bucket, &key).await?)
-        .with_context(|| format!("decode s3://{}/{key}", bucket.name))?;
+        .with_context(|| format!("decode {}", bucket.object_uri(&key)))?;
     if node.node != peer {
         bail!(
             "node lease {key} identifies unexpected node {:?}",
@@ -323,14 +369,13 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
             .filter(|value| !value.trim().is_empty())
     };
     if options.bucket.is_none() {
-        options.bucket =
-            env("CELLD_BUCKET").map(|value| value.trim_start_matches("s3://").to_string());
+        options.bucket = env("CELLD_BUCKET");
     }
     if options.endpoint.is_none() {
         options.endpoint = env("S3_ENDPOINT");
     }
     if !options.dry_run && options.bucket.is_none() {
-        bail!("celld deploy requires --bucket s3://NAME (or CELLD_BUCKET)");
+        bail!("celld deploy requires --bucket [s3://|gs://]NAME (or CELLD_BUCKET)");
     }
     let built = deploy::build(&options)?;
     built.report();
@@ -349,7 +394,7 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
         .or_else(|| env("AWS_DEFAULT_REGION"))
         .unwrap_or_else(|| "us-east-1".to_string());
     let storage = normalize_storage(&bucket, options.endpoint.as_deref(), &region, None)?;
-    let store = s3_client(&storage)?;
+    let store = storage_client(&storage)?;
     validate_bucket(&store).await?;
     let started = std::time::Instant::now();
     deploy::write(&store, &built).await?;
@@ -358,7 +403,7 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
         built.script_name,
         started.elapsed().as_secs_f64()
     );
-    println!("  s3://{bucket}/{}", built.prefix);
+    println!("  {}", storage.object_uri(&built.prefix));
     println!("Current Version ID: {}", built.version);
     println!("Nodes load a deployment at startup; restart them to serve this version.");
     Ok(())
@@ -368,7 +413,7 @@ async fn get_string(bucket: &Bucket, key: &str) -> anyhow::Result<String> {
     let (bytes, _) = bucket
         .get(key)
         .await?
-        .with_context(|| format!("read s3://{}/{key}: no such key", bucket.name))?;
+        .with_context(|| format!("read {}: no such key", bucket.object_uri(key)))?;
     String::from_utf8(bytes.to_vec()).context("deployment module is not UTF-8")
 }
 

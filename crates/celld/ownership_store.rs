@@ -79,8 +79,8 @@ pub fn now_ms() -> u64 {
 
 /// The production-compatible conditional object store used by ownership
 /// effects. A failed write is always reported to the core as ambiguous unless
-/// S3 definitively returned HTTP 412.
-pub struct S3Ownership {
+/// the provider definitively rejected the precondition.
+pub struct ObjectStoreOwnership {
     bucket: Bucket,
     lease_bucket: Bucket,
     node: String,
@@ -103,7 +103,15 @@ pub struct LiveLoad {
     pub shed_cells: AtomicU64,
 }
 
-impl S3Ownership {
+impl ObjectStoreOwnership {
+    pub fn backend_name(&self) -> &'static str {
+        match self.bucket.scheme() {
+            "s3" => "s3",
+            "gs" => "gcs",
+            _ => unreachable!("unsupported storage scheme"),
+        }
+    }
+
     pub fn new(bucket: Bucket, node: String) -> Self {
         Self {
             lease_bucket: bucket.clone(),
@@ -363,8 +371,28 @@ impl S3Ownership {
             return Ok(None);
         };
         let value = serde_json::from_slice(&bytes)
-            .with_context(|| format!("decode s3://{}/{key}", bucket.name))?;
+            .with_context(|| format!("decode {}", bucket.object_uri(key)))?;
         Ok(Some((value, version)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ObjectStoreOwnership;
+    use crate::bucket::Bucket;
+    use crate::storage_backend::ObjectStorageConfig;
+
+    #[test]
+    fn ownership_name_tracks_storage_provider() {
+        for (uri, expected) in [("bucket", "s3"), ("gs://bucket", "gcs")] {
+            let storage =
+                ObjectStorageConfig::from_bucket_uri(uri, None, "us-east-1").unwrap();
+            let ownership = ObjectStoreOwnership::new(
+                Bucket::open(storage, None).unwrap(),
+                "node".into(),
+            );
+            assert_eq!(ownership.backend_name(), expected);
+        }
     }
 }
 

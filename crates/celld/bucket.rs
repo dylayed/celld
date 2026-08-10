@@ -1,13 +1,13 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! The engine's single S3 client: the `object_store` crate `celld-ltx`
+//! The engine's object-store client: the `object_store` crate `celld-ltx`
 //! already links, bound to one bucket (wiki/designs/s3-client-dedup.md).
 //! Replaces aws-sdk-s3. No call site streamed a body, so everything is
 //! in-memory `Bytes`.
 //!
 //! Error contract, relied on by the self-fence: `put_cas` answers
-//! `Ok(None)` only for a clean 412/409 rejection; every other failure is
-//! ambiguous — the write may have committed — and surfaces as `Err`.
+//! `Ok(None)` only for a definite precondition rejection; every other failure
+//! is ambiguous — the write may have committed — and surfaces as `Err`.
 
 use crate::storage_backend::ObjectStorageConfig;
 use anyhow::anyhow;
@@ -30,8 +30,8 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// One S3-compatible bucket. Cheap to clone; each `open` builds its own
-/// HTTP transport, so a dedicated instance also isolates its traffic.
+/// One configured object-storage bucket. Cheap to clone; each `open` builds
+/// its own HTTP transport, so a dedicated instance also isolates its traffic.
 #[derive(Clone)]
 pub struct Bucket {
     store: Arc<dyn ObjectStore>,
@@ -75,14 +75,28 @@ impl Bucket {
         };
         let ordinary_retry = retry(2);
         let cas_retry = retry(0);
-        let (store, cas_store) =
-            storage_config.build_bucket_stores(options, ordinary_retry, cas_retry)?;
+        let (store, cas_store) = storage_config
+            .build_bucket_stores(options, ordinary_retry, cas_retry)
+            .map_err(|e| anyhow!(e))?;
+        let clean_name = storage_config.bucket().to_string();
         Ok(Bucket {
             store,
             cas_store,
-            name: storage_config.bucket().to_string(),
+            name: clean_name,
             storage_config,
         })
+    }
+
+    pub(crate) fn object_uri(&self, key: &str) -> String {
+        self.storage_config.object_uri(key)
+    }
+
+    pub(crate) fn uri(&self) -> String {
+        self.storage_config.uri()
+    }
+
+    pub(crate) fn scheme(&self) -> &'static str {
+        self.storage_config.scheme()
     }
 
     /// Body and object version, or `None` when the key does not exist.
@@ -93,11 +107,11 @@ impl Bucket {
                 let bytes = result
                     .bytes()
                     .await
-                    .with_context(|| format!("read body s3://{}/{key}", self.name))?;
+                    .with_context(|| format!("read body {}", self.object_uri(key)))?;
                 Ok(Some((bytes, version)))
             }
             Err(Error::NotFound { .. }) => Ok(None),
-            Err(error) => Err(anyhow!(error).context(format!("read s3://{}/{key}", self.name))),
+            Err(error) => Err(anyhow!(error).context(format!("read {}", self.object_uri(key)))),
         }
     }
 
@@ -109,7 +123,7 @@ impl Bucket {
                 Ok(Some((meta.size as u64, version)))
             }
             Err(Error::NotFound { .. }) => Ok(None),
-            Err(error) => Err(anyhow!(error).context(format!("head s3://{}/{key}", self.name))),
+            Err(error) => Err(anyhow!(error).context(format!("head {}", self.object_uri(key)))),
         }
     }
 
@@ -117,11 +131,11 @@ impl Bucket {
         self.store
             .put(&Path::from(key), body.into())
             .await
-            .with_context(|| format!("write s3://{}/{key}", self.name))?;
+            .with_context(|| format!("write {}", self.object_uri(key)))?;
         Ok(())
     }
 
-    /// Size plus one `x-amz-meta-*` value, or `None` when the key does not
+    /// Size plus one user-metadata value, or `None` when the key does not
     /// exist. A plain `head` cannot see user metadata; this one can.
     pub async fn head_with_meta(
         &self,
@@ -141,11 +155,11 @@ impl Bucket {
                 Ok(Some((result.meta.size as u64, value)))
             }
             Err(Error::NotFound { .. }) => Ok(None),
-            Err(error) => Err(anyhow!(error).context(format!("head s3://{}/{key}", self.name))),
+            Err(error) => Err(anyhow!(error).context(format!("head {}", self.object_uri(key)))),
         }
     }
 
-    /// Plain write carrying `x-amz-meta-*` user metadata.
+    /// Plain write carrying user metadata.
     pub async fn put_with_meta(
         &self,
         key: &str,
@@ -166,7 +180,7 @@ impl Bucket {
         self.store
             .put_opts(&Path::from(key), body.into(), options)
             .await
-            .with_context(|| format!("write s3://{}/{key}", self.name))?;
+            .with_context(|| format!("write {}", self.object_uri(key)))?;
         Ok(())
     }
 
@@ -195,17 +209,17 @@ impl Bucket {
             }
             Err(Error::Precondition { .. } | Error::AlreadyExists { .. }) => Ok(None),
             Err(error) => Err(anyhow!(error).context(format!(
-                "conditional write s3://{}/{key} may have committed",
-                self.name
+                "conditional write {} may have committed",
+                self.object_uri(key)
             ))),
         }
     }
 
-    /// Idempotent: deleting an absent key succeeds, as S3's DELETE does.
+    /// Idempotent: deleting an absent key succeeds.
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
         match self.store.delete(&Path::from(key)).await {
             Ok(()) | Err(Error::NotFound { .. }) => Ok(()),
-            Err(error) => Err(anyhow!(error).context(format!("delete s3://{}/{key}", self.name))),
+            Err(error) => Err(anyhow!(error).context(format!("delete {}", self.object_uri(key)))),
         }
     }
 
@@ -215,7 +229,7 @@ impl Bucket {
         let mut stream = self.store.list(Some(&path));
         let mut objects = Vec::new();
         while let Some(meta) = stream.next().await {
-            objects.push(meta.with_context(|| format!("list s3://{}/{prefix}", self.name))?);
+            objects.push(meta.with_context(|| format!("list {}", self.object_uri(prefix)))?);
         }
         Ok(objects)
     }
@@ -227,7 +241,7 @@ impl Bucket {
             None => Ok(false),
             Some(Ok(_)) => Ok(true),
             Some(Err(error)) => {
-                Err(anyhow!(error).context(format!("list s3://{}/{prefix}", self.name)))
+                Err(anyhow!(error).context(format!("list {}", self.object_uri(prefix))))
             }
         }
     }
@@ -240,7 +254,7 @@ impl Bucket {
             .store
             .list_with_delimiter(Some(&path))
             .await
-            .with_context(|| format!("list s3://{}/{prefix}", self.name))?;
+            .with_context(|| format!("list {}", self.object_uri(prefix)))?;
         Ok(result
             .common_prefixes
             .into_iter()
@@ -253,7 +267,7 @@ impl Bucket {
     pub async fn validate(&self) -> anyhow::Result<()> {
         match self.store.list(None).next().await {
             None | Some(Ok(_)) => Ok(()),
-            Some(Err(error)) => Err(anyhow!(error).context(format!("validate s3://{}", self.name))),
+            Some(Err(error)) => Err(anyhow!(error).context(format!("validate {}", self.uri()))),
         }
     }
 }
@@ -278,12 +292,12 @@ pub fn is_unauthorized(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod live_cas {
     use super::Bucket;
-    use crate::storage_backend::{ObjectStorageConfig, StaticCredentials};
 
-    // Live CAS contract against a real S3-compatible bucket (R2). Gated on
-    // CELLD_CAS_LIVE=1 so it never runs in CI; a mock cannot answer whether
-    // object_store maps R2's precondition failures to Ok(None) (the fencing
-    // contract) rather than Err. Run:
+    // Live CAS contract against the selected provider. Gated on
+    // CELLD_CAS_LIVE=1 so it never reaches a provider in CI; a mock cannot
+    // answer whether object_store maps that provider's precondition failures
+    // to Ok(None) (the fencing contract) rather than Err.
+    // S3-compatible example:
     //   CELLD_CAS_LIVE=1 CELLD_CAS_BUCKET=<b> CELLD_CAS_ENDPOINT=<ep> AWS_*=... \
     //     cargo test -p celld put_cas_contract -- --nocapture
     #[tokio::test]
@@ -294,14 +308,8 @@ mod live_cas {
         let name = std::env::var("CELLD_CAS_BUCKET").expect("CELLD_CAS_BUCKET");
         let endpoint = std::env::var("CELLD_CAS_ENDPOINT").ok();
         let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "auto".into());
-        let credentials = StaticCredentials {
-            access_key_id: std::env::var("AWS_ACCESS_KEY_ID").unwrap(),
-            secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY").unwrap(),
-            session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
-        };
-        let storage = ObjectStorageConfig::from_bucket_uri(&name, endpoint.as_deref(), &region)
-            .expect("normalize storage")
-            .with_credentials(credentials);
+        let storage = crate::fleet::normalize_storage(&name, endpoint.as_deref(), &region, None)
+            .expect("normalize storage");
         let bucket = Bucket::open(storage, Some("cas-test")).expect("open bucket");
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -324,20 +332,20 @@ mod live_cas {
                 .is_none(),
             "create over an existing key must be Ok(None)"
         );
-        // 3. Update with the current etag applies.
+        // 3. Update with the current object version applies.
         bucket
             .put_cas(&key, b"v3".to_vec(), Some(&e1))
             .await
             .expect("update must not error")
-            .expect("update with current etag must apply (Ok(Some))");
-        // 4. Update with the now-stale etag is cleanly rejected — the fencing case.
+            .expect("update with current object version must apply (Ok(Some))");
+        // 4. Update with the now-stale version is cleanly rejected — the fencing case.
         assert!(
             bucket
                 .put_cas(&key, b"v4".to_vec(), Some(&e1))
                 .await
                 .expect("stale update must not error")
                 .is_none(),
-            "update with a stale etag must be Ok(None) — the fencing contract"
+            "update with a stale object version must be Ok(None) — the fencing contract"
         );
         bucket.delete(&key).await.expect("cleanup delete");
         eprintln!("CAS verified on {name}: create / reject-create / update / reject-stale");

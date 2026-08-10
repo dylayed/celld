@@ -92,7 +92,7 @@ impl AssetResolver {
         let (bytes, _) = bucket
             .get(&key)
             .await?
-            .with_context(|| format!("read s3://{}/{key}: no such key", bucket.name))?;
+            .with_context(|| format!("read {}: no such key", bucket.object_uri(&key)))?;
         let sha256 = format!("{:x}", Sha256::digest(&bytes));
         if sha256 != reference.sha256 {
             return Err(anyhow!("asset index checksum mismatch"));
@@ -494,8 +494,8 @@ impl AssetResolver {
             .with_context(|| format!("read asset {resolved_path}"))?
             .with_context(|| {
                 format!(
-                    "asset {resolved_path} missing from s3://{}/{key}",
-                    self.inner.bucket.name
+                    "asset {resolved_path} missing from {}",
+                    self.inner.bucket.object_uri(&key)
                 )
             })?;
         if body.len() as u64 != entry.bytes {
