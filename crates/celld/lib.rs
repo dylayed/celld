@@ -20,6 +20,8 @@ pub mod deploy;
 /// for it.
 #[cfg(all(test, celld_internal_tests))]
 mod fault;
+mod storage_backend;
+
 pub mod fleet;
 pub mod js;
 pub mod ltx_repl;

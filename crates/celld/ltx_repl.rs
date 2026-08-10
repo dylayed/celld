@@ -21,12 +21,12 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::storage_backend::ObjectStorageConfig;
 use anyhow::anyhow;
 use celld_ltx::object_store::ObjectStore;
 use celld_ltx::replica;
 use celld_ltx::Db;
 use celld_ltx::ObjectStoreClient;
-use celld_ltx::ObjectStoreConfig;
 use celld_ltx::Replica;
 use celld_ltx::TXID;
 use tokio::sync::Notify;
@@ -39,7 +39,6 @@ use crate::replication::sqlite_snapshot;
 use crate::replication::ActivationOptions;
 use crate::replication::ActivationResult;
 use crate::replication::RestoredSnapshot;
-use crate::replication::StorageCredentials;
 use crate::replication::SyncWait;
 
 /// Max cells uploading concurrently across the node. Caps blocking-pool threads
@@ -70,10 +69,7 @@ type CellHandle = Arc<Cell>;
 pub struct LtxRepl {
     /// Local root: cell dbs live at `watch/<cell>/ltx/e<epoch>/db.sqlite`.
     watch: PathBuf,
-    bucket: String,
-    endpoint: Option<String>,
-    region: String,
-    credentials: Option<StorageCredentials>,
+    storage: ObjectStorageConfig,
     /// One connection pool for the whole node, shared by every cell client.
     store: Arc<dyn ObjectStore>,
     cells: Arc<Mutex<HashMap<(String, u64), CellHandle>>>,
@@ -83,15 +79,9 @@ pub struct LtxRepl {
 }
 
 impl LtxRepl {
-    pub fn start(
-        watch: &Path,
-        bucket: String,
-        endpoint: Option<String>,
-        region: String,
-        credentials: Option<StorageCredentials>,
-    ) -> anyhow::Result<Self> {
-        let store = node_config(&bucket, endpoint.as_deref(), &region, credentials.as_ref())
-            .build_store()
+    pub fn start(watch: &Path, storage: ObjectStorageConfig) -> anyhow::Result<Self> {
+        let store = storage
+            .build_ltx_store()
             .map_err(|error| anyhow!("build shared object store: {error}"))?;
         let cells: Arc<Mutex<HashMap<(String, u64), CellHandle>>> = Arc::default();
         let dirty = Arc::new(Notify::new());
@@ -101,10 +91,7 @@ impl LtxRepl {
         tokio::spawn(sync_loop(cells.clone(), dirty.clone(), slots));
         Ok(Self {
             watch: watch.to_path_buf(),
-            bucket,
-            endpoint,
-            region,
-            credentials,
+            storage,
             store,
             cells,
             dirty,
@@ -123,13 +110,9 @@ impl LtxRepl {
     /// prefix. `cells/<cell>/ltx/e<epoch>` matches [`Self::db_path`]'s remote
     /// twin so the same coordinates address local and replica state.
     fn client_for(&self, cell: &str, epoch: u64) -> ObjectStoreClient {
-        let mut config = node_config(
-            &self.bucket,
-            self.endpoint.as_deref(),
-            &self.region,
-            self.credentials.as_ref(),
-        );
-        config.path = format!("cells/{cell}/ltx/e{epoch}");
+        let config = self
+            .storage
+            .replica_config(format!("cells/{cell}/ltx/e{epoch}"));
         ObjectStoreClient::with_store(config, self.store.clone())
     }
 
@@ -482,53 +465,5 @@ async fn sync_loop(
                 }
             });
         }
-    }
-}
-
-/// Node-level object-store config (no per-cell prefix). `build_store` on this
-/// yields the one shared client; per-cell clients set only `path`.
-fn node_config(
-    bucket: &str,
-    endpoint: Option<&str>,
-    region: &str,
-    credentials: Option<&StorageCredentials>,
-) -> ObjectStoreConfig {
-    let endpoint = endpoint.unwrap_or_default().to_string();
-    // Static credentials come from the managed control plane when present,
-    // else the `AWS_*` env the node already carries. Without this,
-    // `build_store` sees empty keys and object_store falls back to the
-    // instance credential provider, which off-EC2 sends unsigned requests (R2
-    // answers "404 page not found").
-    let env = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
-    let access_key_id = credentials
-        .map(|c| c.access_key_id.clone())
-        .filter(|value| !value.is_empty())
-        .or_else(|| env("AWS_ACCESS_KEY_ID"))
-        .unwrap_or_default();
-    let secret_access_key = credentials
-        .map(|c| c.secret_access_key.clone())
-        .filter(|value| !value.is_empty())
-        .or_else(|| env("AWS_SECRET_ACCESS_KEY"))
-        .unwrap_or_default();
-    // Temporary R2/STS credentials require the session token, or signing fails.
-    let session_token = credentials
-        .and_then(|c| c.session_token.clone())
-        .filter(|value| !value.is_empty())
-        .or_else(|| env("AWS_SESSION_TOKEN"))
-        .unwrap_or_default();
-    ObjectStoreConfig {
-        bucket: bucket.to_string(),
-        path: String::new(),
-        region: region.to_string(),
-        // A custom endpoint (R2/MinIO) uses path-style addressing, matching
-        // `ObjectStoreConfig::from_url`'s default for non-AWS hosts.
-        force_path_style: !endpoint.is_empty(),
-        endpoint,
-        access_key_id,
-        secret_access_key,
-        session_token,
-        skip_verify: false,
-        part_size: 0,
-        concurrency: 0,
     }
 }

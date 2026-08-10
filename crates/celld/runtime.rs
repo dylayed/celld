@@ -11,7 +11,7 @@ use crate::js::{
     self, CellJob, FetchRequest, HttpResponse, Worker, WorkerConfig, WorkerConfigOptions,
 };
 use crate::ltx_repl::LtxRepl;
-use crate::replication::{ActivationOptions, StorageCredentials, SyncWait};
+use crate::replication::{ActivationOptions, SyncWait};
 use crate::storage;
 use crate::wake::WakeFlusher;
 use anyhow::{anyhow, Context};
@@ -106,20 +106,11 @@ pub struct Replication {
 
 impl Replication {
     pub fn start(
-        bucket: crate::bucket::Bucket,
+        storage: crate::storage_backend::ObjectStorageConfig,
         watch: &Path,
-        endpoint: Option<String>,
-        region: String,
-        credentials: Option<StorageCredentials>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            ltx: Arc::new(LtxRepl::start(
-                watch,
-                bucket.name,
-                endpoint,
-                region,
-                credentials,
-            )?),
+            ltx: Arc::new(LtxRepl::start(watch, storage)?),
         })
     }
 

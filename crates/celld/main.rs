@@ -70,7 +70,7 @@ struct MemoryOwnership {
     node: String,
     owners: BTreeMap<String, OwnerRecord>,
     leases: BTreeMap<String, NodeLeaseRecord>,
-    next_etag: u64,
+    next_version: u64,
 }
 
 #[derive(Clone)]
@@ -136,18 +136,18 @@ impl Ownership {
                     CasGuard::Match(expected) => memory
                         .owners
                         .get(cell)
-                        .is_some_and(|owner| owner.etag == expected),
+                        .is_some_and(|owner| owner.version == expected),
                 };
                 if allowed {
-                    let etag = format!("e{}", memory.next_etag);
-                    memory.next_etag += 1;
+                    let version = format!("e{}", memory.next_version);
+                    memory.next_version += 1;
                     let node = memory.node.clone();
                     memory.owners.insert(
                         cell.into(),
                         OwnerRecord {
                             node: Some(node),
                             epoch,
-                            etag,
+                            version,
                         },
                     );
                 }
@@ -157,12 +157,14 @@ impl Ownership {
                     CasOutcome::Rejected
                 })
             }
-            Self::S3(s3) => s3.cas_owner(cell, guard, epoch).await.map_err(|error| {
-                // Any transport or 5xx failure may have happened after S3
-                // committed. The core reconciles by reading the owner again.
-                eprintln!("celld ownership CAS ambiguous: {error:#}");
-                Failure::Ambiguous
-            }),
+            Self::S3(s3) => {
+                s3.cas_owner(cell, guard, epoch).await.map_err(|error| {
+                    // Any transport or 5xx failure may have happened after S3
+                    // committed. The core reconciles by reading the owner again.
+                    eprintln!("celld ownership CAS ambiguous: {error:#}");
+                    Failure::Ambiguous
+                })
+            }
         }
     }
 
@@ -175,14 +177,14 @@ impl Ownership {
                     owner.node.as_deref() == Some(node.as_str()) && owner.epoch == epoch
                 });
                 if releasable {
-                    let etag = format!("e{}", memory.next_etag);
-                    memory.next_etag += 1;
+                    let version = format!("e{}", memory.next_version);
+                    memory.next_version += 1;
                     memory.owners.insert(
                         cell.into(),
                         OwnerRecord {
                             node: None,
                             epoch,
-                            etag,
+                            version,
                         },
                     );
                 }
@@ -215,22 +217,24 @@ impl Ownership {
                 let allowed = match guard {
                     CasGuard::Absent => current.is_none(),
                     CasGuard::Match(expected) => {
-                        current.is_some_and(|lease| lease.etag == expected)
+                        current.is_some_and(|lease| lease.version == expected)
                     }
                 };
                 if !allowed {
                     return Ok(LeaseCasOutcome::Rejected);
                 }
-                let etag = format!("e{}", memory.next_etag);
-                memory.next_etag += 1;
-                record.etag = etag.clone();
+                let version = format!("e{}", memory.next_version);
+                memory.next_version += 1;
+                record.version = version.clone();
                 memory.leases.insert(record.node.clone(), record);
-                Ok(LeaseCasOutcome::Applied { etag })
+                Ok(LeaseCasOutcome::Applied { version })
             }
-            Self::S3(s3) => s3.cas_node_lease(guard, &record).await.map_err(|error| {
-                eprintln!("celld node-lease CAS ambiguous: {error:#}");
-                Failure::Ambiguous
-            }),
+            Self::S3(s3) => {
+                s3.cas_node_lease(guard, &record).await.map_err(|error| {
+                    eprintln!("celld node-lease CAS ambiguous: {error:#}");
+                    Failure::Ambiguous
+                })
+            }
         }
     }
 
@@ -830,7 +834,7 @@ impl Actor {
                 node: node.clone(),
                 owners: BTreeMap::new(),
                 leases: BTreeMap::new(),
-                next_etag: 1,
+                next_version: 1,
             })))
         };
         let live_load = match &ownership {
@@ -4455,12 +4459,13 @@ async fn async_main() -> anyhow::Result<()> {
             let bucket = settings
                 .bucket
                 .ok_or_else(|| anyhow::anyhow!("celld diagnose requires --bucket"))?;
-            let client = fleet::s3_client_with_credentials(
+            let backend = fleet::normalize_storage(
                 &bucket,
                 settings.endpoint.as_deref(),
                 &settings.region,
                 managed_storage.as_ref(),
             )?;
+            let client = fleet::s3_client(&backend)?;
             return fleet::diagnose(&client, peers, settings.unsafe_public_advertise).await;
         }
         Action::Run(settings) => settings,
@@ -4518,14 +4523,18 @@ async fn async_main() -> anyhow::Result<()> {
     } else {
         None
     };
-    let storage_credentials =
-        managed_storage
-            .as_ref()
-            .map(|storage| celld::replication::StorageCredentials {
-                access_key_id: storage.access_key_id.clone(),
-                secret_access_key: storage.secret_access_key.clone(),
-                session_token: storage.session_token.clone(),
-            });
+    let storage_backend = settings
+        .bucket
+        .as_deref()
+        .map(|bucket| {
+            fleet::normalize_storage(
+                bucket,
+                settings.endpoint.as_deref(),
+                &settings.region,
+                managed_storage.as_ref(),
+            )
+        })
+        .transpose()?;
     let (tx, rx) = mpsc::unbounded_channel();
     let sample_tx = tx.clone();
     let alarm_tx = tx.clone();
@@ -4558,25 +4567,18 @@ async fn async_main() -> anyhow::Result<()> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join(format!("celld-{}", std::process::id())));
     let mut deploy_agent = None;
+    let load_backend = storage_backend
+        .as_ref()
+        .filter(|_| settings.load_deployment);
     let (runtime, ownership, peer_key, wake_scan, assets, asset_script) =
-        if let Some(bucket) = settings.bucket.clone().filter(|_| settings.load_deployment) {
-            let client = fleet::s3_client_with_credentials(
-                &bucket,
-                settings.endpoint.as_deref(),
-                &settings.region,
-                managed_storage.as_ref(),
-            )?;
+        if let Some(backend) = load_backend {
+            let client = fleet::s3_client(backend)?;
             if settings.control_plane {
                 fleet::validate_managed_bucket(&client).await?;
             } else {
                 fleet::validate_bucket(&client).await?;
             }
-            let lease_client = fleet::s3_lease_client_with_credentials(
-                &bucket,
-                settings.endpoint.as_deref(),
-                &settings.region,
-                managed_storage.as_ref(),
-            )?;
+            let lease_client = fleet::s3_lease_client_with_credentials(backend)?;
             if settings.control_plane {
                 celld::control_plane::wait_for_initial_deployment(&client).await?;
                 deploy_agent = Some(client.clone());
@@ -4637,13 +4639,7 @@ async fn async_main() -> anyhow::Result<()> {
             // of today's manifest. Start it even for a stateless deployment
             // so a later deployment can introduce cells without changing the
             // durability contract underneath the node.
-            let replication = Some(Replication::start(
-                client.clone(),
-                &data_dir,
-                settings.endpoint.clone(),
-                settings.region.clone(),
-                storage_credentials.clone(),
-            )?);
+            let replication = Some(Replication::start(backend.clone(), &data_dir)?);
             let asset_script = Some(Arc::<str>::from(primary_script));
             let assets = Arc::new(asset_resolvers);
             let runtime = RuntimeManager::start(RuntimeOptions {
@@ -4706,20 +4702,10 @@ async fn async_main() -> anyhow::Result<()> {
                 text: Vec::new(),
                 compat: Compat::default(),
             };
-            let (ownership, peer_key, wake, wake_scan) = match settings.bucket.clone() {
-                Some(bucket) => {
-                    let client = fleet::s3_client_with_credentials(
-                        &bucket,
-                        settings.endpoint.as_deref(),
-                        &settings.region,
-                        managed_storage.as_ref(),
-                    )?;
-                    let lease_client = fleet::s3_lease_client_with_credentials(
-                        &bucket,
-                        settings.endpoint.as_deref(),
-                        &settings.region,
-                        managed_storage.as_ref(),
-                    )?;
+            let (ownership, peer_key, wake, wake_scan) = match storage_backend.as_ref() {
+                Some(backend) => {
+                    let client = fleet::s3_client(backend)?;
+                    let lease_client = fleet::s3_lease_client_with_credentials(backend)?;
                     let peer_key = peer_auth::load_or_create(&client).await?;
                     let wake = Arc::new(celld::wake::WakeFlusher::new());
                     celld::js::set_arm_gate(ArmGate {
@@ -4766,20 +4752,10 @@ async fn async_main() -> anyhow::Result<()> {
                 None,
             )
         } else {
-            let (ownership, peer_key) = match settings.bucket.clone() {
-                Some(bucket) => {
-                    let client = fleet::s3_client_with_credentials(
-                        &bucket,
-                        settings.endpoint.as_deref(),
-                        &settings.region,
-                        managed_storage.as_ref(),
-                    )?;
-                    let lease_client = fleet::s3_lease_client_with_credentials(
-                        &bucket,
-                        settings.endpoint.as_deref(),
-                        &settings.region,
-                        managed_storage.as_ref(),
-                    )?;
+            let (ownership, peer_key) = match storage_backend.as_ref() {
+                Some(backend) => {
+                    let client = fleet::s3_client(backend)?;
+                    let lease_client = fleet::s3_lease_client_with_credentials(backend)?;
                     let peer_key = peer_auth::load_or_create(&client).await?;
                     (
                         Some(Ownership::S3(Arc::new(

@@ -293,7 +293,7 @@ async fn gc_markers(
 
 async fn retire_dead_node(bucket: &Bucket, node: &str, now_ms: u64) -> anyhow::Result<bool> {
     let key = format!("nodes/{node}.json");
-    let Some((record, etag)) = read_node(bucket, &key).await? else {
+    let Some((record, version)) = read_node(bucket, &key).await? else {
         return Ok(true);
     };
     if !celld_logic::dead_node_reconciliation::node_record_is_dead(
@@ -312,7 +312,7 @@ async fn retire_dead_node(bucket: &Bucket, node: &str, now_ms: u64) -> anyhow::R
         expires_ms: 0,
         ..record
     })?;
-    match bucket.put_cas(&key, tombstone, Some(&etag)).await? {
+    match bucket.put_cas(&key, tombstone, Some(&version)).await? {
         Some(_) => {
             bucket.delete(&key).await?;
             Ok(true)
@@ -322,10 +322,10 @@ async fn retire_dead_node(bucket: &Bucket, node: &str, now_ms: u64) -> anyhow::R
 }
 
 async fn read_node(bucket: &Bucket, key: &str) -> anyhow::Result<Option<(NodeWire, String)>> {
-    let Some((bytes, etag)) = bucket.get(key).await? else {
+    let Some((bytes, version)) = bucket.get(key).await? else {
         return Ok(None);
     };
     let record = serde_json::from_slice(&bytes)
         .with_context(|| format!("decode s3://{}/{key}", bucket.name))?;
-    Ok(Some((record, etag)))
+    Ok(Some((record, version)))
 }
